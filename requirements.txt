@@ -1,0 +1,5 @@
+django
+xlwt
+pypinpyin
+pyecharts
+django-sslserver

@@ -1,0 +1,229 @@
+import base64
+import shutil
+import time
+from io import BytesIO
+
+import numpy as np
+import os
+import pandas as pd
+import requests
+from PIL import Image, ImageDraw, ImageFont
+from ..settings import BASE_DIR
+from django.shortcuts import render
+from dbmodel.models import FaceImage, People
+from dbmodel.models import Image as image_db
+from .FaceExtractor import face_locations
+from django.contrib import messages
+info_dict = {}
+info =""
+
+# client_id 为官网获取的AK， client_secret 为官网获取的SK
+api_key = "你的api_key"
+secret_key = "你的secret_key"
+
+def initialing():
+    return
+    # 载入已保存的模型
+    global info_dict
+    info_dict = {}
+    model_saving_path = os.path.join(BASE_DIR, 'cv', 'model')
+    face_objs = FaceImage.objects.all()
+    for face_obj in face_objs:
+        path = face_obj.path
+        name = path[:path.rfind('.')]
+        path = os.path.join(model_saving_path, face_obj.path)
+        info = np.load(path[:path.rfind('.')]+'.npy')
+        info_dict[name] = info
+    return_str = ""
+    for i in info_dict.keys():
+        return_str += i + ','
+    return return_str
+
+def face_matchng(path,request,tolerance=1):
+    img_path = path
+
+    # 获取access_token
+    global info
+    info = "正在初始化"
+    host = 'https://aip.baidubce.com/oauth/2.0/token?grant_type=client_credentials&client_id=%s&client_secret=%s' % (
+    api_key, secret_key)
+    response = requests.get(host)
+    if response:
+        access_token = response.json()["access_token"]
+    else:
+        return 0
+
+
+    result = []
+    info = "正在分割人脸"
+    try:    # 使用百度api分割人脸
+        try:
+            if request.POST["use_baidu"] == "yes":
+                pass
+            else:
+                raise "NotUsingBaidu"
+        except:
+            image_obj = image_db.objects.get(path=os.path.basename(img_path))
+            if not image_obj.use_baidu:
+                raise "NotUsingBaidu"
+        url = 'http://124.221.104.193/static/upload/' + os.path.basename(img_path)
+        print("地址：", url)
+        # 设置请求包体
+        request_url = "https://aip.baidubce.com/rest/2.0/face/v3/detect"
+        request_url = request_url + "?access_token=" + access_token
+        headers = {'content-type': 'application/json'}
+        result = []
+        params = '{"image":"%s","image_type":"URL","max_face_num":100}' % url
+        response = requests.post(request_url, data=params, headers=headers)
+        print(response.json())
+        if response.json()["error_msg"] != "SUCCESS":
+            raise "baiduExtractError"
+        facelist = response.json()["result"]["face_list"]
+        origin_locations = []
+        locations = []
+        for face in facelist:
+            origin_locations.append(face["location"])
+        face_list = origin_locations
+        for i in range(len(face_list)):
+            box = (face_list[i]["left"], face_list[i]["top"], face_list[i]["left"] + face_list[i]["width"],
+                   face_list[i]["top"] + face_list[i]["height"])
+            locations.append([box[1], box[2], box[3], box[0]])
+        print("使用百度api分割人脸")
+    except: # 使用face_recognition分割人脸
+        locations = face_locations(img_path)
+        print("使用本地库分割人脸")
+    origin = Image.open(img_path)
+    time_now = os.path.basename(img_path)[:os.path.basename(img_path).rfind('.')]
+    file_type = os.path.basename(img_path)[os.path.basename(img_path).rfind('.'):]
+    # 设置请求包体
+    request_url = "https://aip.baidubce.com/rest/2.0/face/v3/multi-search"
+    request_url = request_url + "?access_token=" + access_token
+    headers = {'content-type': 'application/json'}
+    try:
+        image_obj = image_db.objects.get(path=os.path.basename(img_path))
+        image_obj.count = len(locations)
+        image_obj.save()
+    except:
+        pass
+    # 分割人脸并一一调用百度api
+    for i in range(len(locations)):
+        info = "正在识别第%d个人脸，共%d个" % (i, len(locations))
+        result.append([])
+        box = (locations[i][3], locations[i][0], locations[i][1], locations[i][2])
+        face = origin.crop(box)
+        output_buffer = BytesIO()
+        pic_save_path = str(time_now) + "-" + str(i+1) + img_path[img_path.rfind("."):]
+        pic_save_path = os.path.join(BASE_DIR, "statics", "temp_image", pic_save_path)
+        print(pic_save_path)
+        face.save(pic_save_path)
+        png = open(pic_save_path, 'rb')
+        res = png.read()
+        png.close()
+        image = base64.b64encode(res).decode("ascii")
+        params = '{"image":"%s","image_type":"BASE64","group_id_list":"admin","max_user_num":5,"match_threshold":%d}' % (image,int(tolerance*100))
+        response = requests.post(request_url, data=params, headers=headers)
+        print(response.json())
+        if response.json()["error_msg"] == "SUCCESS":
+            res_info = response.json()["result"]["face_list"][0]["user_list"]
+            for j in range(len(res_info)):
+                result[i].append({"id": res_info[j]["user_id"], "score": res_info[j]["score"]})
+        else:
+            result[i].append(response.json()["error_msg"])
+        time.sleep(0.5)
+
+    # 结果格式化与可视化
+    info = "正在整合信息"
+    recognition_result = []
+    df = pd.DataFrame(result)
+    df.to_excel(os.path.join(BASE_DIR, 'statics', 'temp_image', time_now+'.xls'))
+    pil_image = Image.open(img_path)
+    draw = ImageDraw.Draw(pil_image)
+    font_size = pil_image.size[0] // 50
+    ft = ImageFont.truetype(os.path.join(BASE_DIR, 'cv', 'files', 'arialuni.ttf'), font_size)
+    for i in range(len(locations)):
+        box = (locations[i][3], locations[i][0], locations[i][1], locations[i][2])
+        draw.rectangle(box, None, 'yellow', width=font_size // 8)
+        draw.text((box[0:2]), str(i+1), "red", ft)
+        recognition_result.append([])
+        for j in range(len(result[i])):
+            if result[i][j] == "match user is not found":
+                name = "未知人脸"
+                recognition_result[i].append([name, 0])
+            elif type(result[i][j]) == str:
+                name = "人脸解析出错"
+                recognition_result[i].append([name, 0])
+            elif type(result[i][j]) == dict:
+                try:
+                    name = People.objects.filter(id=result[i][j]["id"])[0].name
+                    recognition_result[i].append([name, result[i][j]["score"]])
+                    if result[i][j]["score"] == 100:
+                        draw.rectangle(box, None, 'lime', width=font_size // 8)
+                except:
+                    name = "本地库丢失id=%s" % result[i][j]["id"]
+                    recognition_result[i].append([name, result[i][j]["score"]])
+                    if result[i][j]["score"] == 100:
+                        draw.rectangle(box, None, 'lime', width=font_size // 8)
+        if recognition_result[i][0][0] == "未知人脸" or recognition_result[i][0][0] == "人脸解析出错":
+            continue
+        draw.text((box[0], box[1] - font_size), str(recognition_result[i][0][0]), "red", ft)
+    img_path = os.path.join('temp_image', time_now + file_type)
+    pil_image.save(os.path.join(BASE_DIR, 'statics', img_path))
+    return_dic = {'path': img_path, 'result': recognition_result}
+    return return_dic
+
+
+def dict_add(path, name):
+    name_path = os.path.split(path)[-1]
+    img_path = name_path[:name_path.find("-")]+name_path[name_path.rfind("."):]
+    try:
+        image_obj = image_db.objects.filter(path=img_path)[0]
+    except:
+        shutil.copy(os.path.join(BASE_DIR, "upload", img_path), os.path.join(BASE_DIR, "cv", "model_image", img_path))
+        image_obj = image_db(path=img_path)
+        image_obj.save()
+    try:
+        pic_save_path = os.path.join(BASE_DIR, 'cv', 'model_image', name+'@'+name_path)
+        fpw = open(pic_save_path, "wb")
+        fpr = open(path, "rb")
+        for line in fpr:
+            fpw.write(line)
+        fpw.close()
+        path = os.path.basename(pic_save_path)
+        name = path[:path.find('@')]
+        uploadtime = pic_save_path[pic_save_path.find('@') + 1:pic_save_path.rfind('-')]
+        uploadtime = time.strftime(r"%Y-%m-%d %H:%M:%S", time.localtime(eval(uploadtime)))
+        print(name, uploadtime, path, "\n")
+        if People.objects.filter(name=name):
+            people = People.objects.filter(name=name)[0]
+        else:
+            people = People(name=name)
+            people.save()
+        obj = FaceImage(name=people, path=path, upload_time=uploadtime, image=image_obj)
+        obj.save()
+        # 百度api上传
+        host = 'https://aip.baidubce.com/oauth/2.0/token?grant_type=client_credentials&client_id=%s&client_secret=%s' % (api_key, secret_key)
+        response = requests.get(host)
+        if response:
+            access_token = response.json()["access_token"]
+        else:
+            return "token获取失败"
+        request_url = "https://aip.baidubce.com/rest/2.0/face/v3/faceset/user/add"
+        request_url = request_url + "?access_token=" + access_token
+        headers = {'content-type': 'application/json'}
+        png = open(pic_save_path, 'rb')
+        res = png.read()
+        png.close()
+        image = base64.b64encode(res).decode("ascii")
+        params = '{"image":"%s","image_type":"BASE64","group_id":"admin","user_id":"%d"}' % (image, people.id)
+        headers = {'content-type': 'application/json'}
+        response = requests.post(request_url, data=params, headers=headers)
+        if response.json()["error_msg"] !="SUCCESS":
+            return "人脸编码失败或图像已存在"
+        else:
+            obj.token = response.json()["result"]["face_token"]
+            obj.logid = response.json()["log_id"]
+            obj.save()
+    except IndexError:
+        print("人脸过于模糊，请提供清晰的正面照")
+        return 0
+    return 1
